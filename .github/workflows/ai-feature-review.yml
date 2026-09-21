@@ -1,0 +1,120 @@
+name: AI Feature Review
+
+# The PR job and the merge gate. review_cli.py decides the exit code
+# (0 clean, 1 blocking findings, 2 reviewer failure); this workflow reads
+# that decision back, it does not compute its own.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # Free, instant, identical on every run. continue-on-error because a
+      # parse failure here is deferred to the model's `typo` category, not
+      # forgiven — the review still needs to run on the same file so the
+      # final gate step can enforce both.
+      - name: Syntax check (site/scripts.js)
+        if: hashFiles('site/scripts.js') != ''
+        continue-on-error: true
+        run: node --check site/scripts.js
+
+      - name: Run AI feature review
+        id: review
+        continue-on-error: true
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python review_cli.py --feature landing_page --mode ci --out review-output.json
+
+      - name: Upload review report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-output
+          path: review-output.json
+
+      - name: Comment on PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = JSON.parse(fs.readFileSync('review-output.json', 'utf8'));
+
+            const severityOrder = { critical: 0, high: 1, medium: 2, low: 3 };
+            const findings = [...report.findings].sort(
+              (a, b) => (severityOrder[a.severity] ?? 9) - (severityOrder[b.severity] ?? 9)
+            );
+            const blockingKeys = new Set(
+              report.blocking.map(f => `${f.file}:${f.line}:${f.summary}`)
+            );
+
+            let body = `### AI Feature Review — \`${report.feature}\` (${report.mode})\n\n`;
+
+            if (!report.ok) {
+              body += `**REVIEW FAILED:** ${report.error}\n\n` +
+                      "This is a reviewer failure, not a verdict on the code.\n";
+            } else if (findings.length === 0) {
+              body += "No findings above the reporting threshold.\n";
+            } else {
+              body += "| Severity | File:Line | Category | Summary | |\n";
+              body += "|---|---|---|---|---|\n";
+              for (const f of findings) {
+                const blocks = blockingKeys.has(`${f.file}:${f.line}:${f.summary}`);
+                body += `| ${String(f.severity).toUpperCase()} | ${f.file}:${f.line} | ` +
+                        `${f.category} | ${f.summary} | ${blocks ? "🚫 blocks merge" : ""} |\n`;
+              }
+            }
+
+            if (report.denied_calls && report.denied_calls.length > 0) {
+              body += "\n**Denied tool calls:**\n";
+              for (const d of report.denied_calls) {
+                body += `- \`${d.tool}(${d.input})\` — ${d.reason}\n`;
+              }
+            }
+
+            body += `\n---\n_${report.turns} turns · ${report.wall_clock_s}s · ` +
+                    `$${Number(report.cost_usd).toFixed(4)} · exit code ${report.exit_code}_`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+      # The single source of truth for pass/fail: review_cli.py's own exit
+      # code, written into review-output.json. Not recomputed here, so the
+      # gate and the comment can never disagree.
+      - name: Enforce merge gate
+        if: always()
+        run: |
+          exit_code=$(node -p "require('./review-output.json').exit_code")
+          echo "Reviewer exit code: $exit_code"
+          exit "$exit_code"
